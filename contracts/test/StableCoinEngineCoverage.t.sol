@@ -8,6 +8,7 @@ import {MockV3Aggregator} from "chainlink-brownie-contracts/contracts/src/v0.8/t
 import {StableCoin} from "../src/StableCoin.sol";
 import {StableCoinEngine} from "../src/StableCoinEngine.sol";
 import {LiquidationAuction} from "../src/LiquidationAuction.sol";
+import {OracleLib} from "../src/libraries/OracleLib.sol";
 
 contract StableCoinEngineCoverageTest is Test {
     using stdStorage for StdStorage;
@@ -103,15 +104,18 @@ contract StableCoinEngineCoverageTest is Test {
         vm.prank(USER);
         s_engine.mintStableCoin(9_500e18);
 
+        vm.warp(block.timestamp + 31 minutes);
         s_wethUsdFeed.updateAnswer(1_000e8);
 
         vm.prank(LIQUIDATOR);
         s_engine.liquidate(address(s_weth), USER, 9_000e18);
 
+        uint256 availableDebt = s_engine.getStableCoinMinted(USER) - s_engine.getDebtReservedForAuction(USER);
+
         vm.prank(LIQUIDATOR);
         vm.expectRevert(
             abi.encodeWithSelector(
-                StableCoinEngine.StableCoinEngine__DebtNotAvailableForLiquidation.selector, 500e18, 600e18
+                StableCoinEngine.StableCoinEngine__DebtNotAvailableForLiquidation.selector, availableDebt, 600e18
             )
         );
         s_engine.liquidate(address(s_wbtc), USER, 600e18);
@@ -156,7 +160,7 @@ contract StableCoinEngineCoverageTest is Test {
     function testGetUsdValueRevertsInvalidPrice() public {
         s_wethUsdFeed.updateAnswer(0);
 
-        vm.expectRevert(StableCoinEngine.StableCoinEngine__InvalidPrice.selector);
+        vm.expectRevert(OracleLib.OracleLib__InvalidPrice.selector);
         s_engine.getUsdValue(address(s_weth), 1 ether);
     }
 
@@ -168,7 +172,7 @@ contract StableCoinEngineCoverageTest is Test {
     function testGetTokenAmountFromUsdRevertsInvalidPrice() public {
         s_wethUsdFeed.updateAnswer(0);
 
-        vm.expectRevert(StableCoinEngine.StableCoinEngine__InvalidPrice.selector);
+        vm.expectRevert(OracleLib.OracleLib__InvalidPrice.selector);
         s_engine.getTokenAmountFromUsd(address(s_weth), 1e18);
     }
 
@@ -195,7 +199,7 @@ contract StableCoinEngineCoverageTest is Test {
     function testStableCoinPriceRevertsOnInvalidPrice() public {
         s_scUsdFeed.updateAnswer(0);
 
-        vm.expectRevert(StableCoinEngine.StableCoinEngine__InvalidPrice.selector);
+        vm.expectRevert(OracleLib.OracleLib__InvalidPrice.selector);
         s_engine.getCurrentStabilityFeeBps();
     }
 
@@ -239,6 +243,7 @@ contract StableCoinEngineCoverageTest is Test {
         vm.prank(USER);
         s_engine.mintStableCoin(9_500e18);
 
+        vm.warp(block.timestamp + 31 minutes);
         s_wethUsdFeed.updateAnswer(1);
 
         vm.prank(LIQUIDATOR);
@@ -254,6 +259,7 @@ contract StableCoinEngineCoverageTest is Test {
         vm.prank(USER);
         s_engine.mintStableCoin(9_500e18);
 
+        vm.warp(block.timestamp + 31 minutes);
         s_wethUsdFeed.updateAnswer(1_000e8);
 
         vm.prank(LIQUIDATOR);

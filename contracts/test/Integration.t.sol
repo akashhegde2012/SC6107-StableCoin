@@ -64,12 +64,15 @@ contract IntegrationTest is Test {
         vm.prank(user);
         s_engine.mintStableCoin(DEBT_TO_MINT);
 
+        vm.warp(block.timestamp + 31 minutes);
         s_wethUsdFeed.updateAnswer(ETH_PRICE_AFTER_DROP);
 
         _mintAndDepositCollateral(bidder, s_wbtc, BIDDER_COLLATERAL);
 
         vm.prank(bidder);
         s_engine.mintStableCoin(2_000e18);
+
+        uint256 debtBeforeLiquidation = s_engine.getStableCoinMinted(user);
 
         vm.prank(bidder);
         s_engine.liquidate(address(s_weth), user, LIQUIDATION_DEBT);
@@ -93,7 +96,7 @@ contract IntegrationTest is Test {
         LiquidationAuction.Auction memory auction = s_auction.getAuction(0);
         assertTrue(auction.settled);
         assertEq(auction.highestBidder, bidder);
-        assertEq(s_engine.getStableCoinMinted(user), 8_000e18);
+        assertApproxEqAbs(s_engine.getStableCoinMinted(user), debtBeforeLiquidation - LIQUIDATION_DEBT, 1);
         assertEq(s_engine.getDebtReservedForAuction(user), 0);
         assertFalse(s_engine.hasActiveLiquidationAuction(user, address(s_weth)));
         assertEq(s_stableCoin.balanceOf(address(s_engine)), 0);

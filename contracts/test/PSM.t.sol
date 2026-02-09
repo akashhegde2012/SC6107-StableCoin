@@ -7,6 +7,7 @@ import {MockV3Aggregator} from "chainlink-brownie-contracts/contracts/src/v0.8/t
 
 import {StableCoin} from "../src/StableCoin.sol";
 import {PSM} from "../src/PSM.sol";
+import {OracleLib} from "../src/libraries/OracleLib.sol";
 
 contract ERC20SixDecimalsMock is ERC20Mock {
     function decimals() public pure override returns (uint8) {
@@ -127,6 +128,7 @@ contract PSMTest is Test {
         vm.prank(USER);
         s_psm.swapStableForStableCoin(address(s_usdc), collateralAmountIn);
 
+        vm.warp(block.timestamp + 31 minutes);
         s_usdcUsdFeed.updateAnswer(102_000_000);
 
         vm.prank(USER);
@@ -141,7 +143,7 @@ contract PSMTest is Test {
         s_usdcUsdFeed.updateAnswer(0);
 
         vm.prank(USER);
-        vm.expectRevert(PSM.PSM__InvalidPrice.selector);
+        vm.expectRevert(OracleLib.OracleLib__InvalidPrice.selector);
         s_psm.swapStableForStableCoin(address(s_usdc), collateralAmountIn);
     }
 

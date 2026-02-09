@@ -189,6 +189,7 @@ contract StableCoinEngineTest is Test {
         vm.prank(USER);
         s_engine.mintStableCoin(9_500e18);
 
+        vm.warp(block.timestamp + 31 minutes);
         s_wethUsdFeed.updateAnswer(1_000e8);
 
         _depositCollateral(LIQUIDATOR, address(s_weth), 10 ether);
@@ -215,6 +216,7 @@ contract StableCoinEngineTest is Test {
         vm.prank(USER);
         s_engine.mintStableCoin(9_000e18);
 
+        vm.warp(block.timestamp + 31 minutes);
         s_wethUsdFeed.updateAnswer(1_000e8);
 
         _depositCollateral(LIQUIDATOR, address(s_weth), 10 ether);
@@ -222,6 +224,7 @@ contract StableCoinEngineTest is Test {
         s_engine.mintStableCoin(1_000e18);
 
         uint256 startingHealthFactor = s_engine.getHealthFactor(USER);
+        uint256 debtBeforeLiquidation = s_engine.getStableCoinMinted(USER);
 
         vm.prank(LIQUIDATOR);
         s_engine.liquidate(address(s_weth), USER, 1_000e18);
@@ -235,7 +238,7 @@ contract StableCoinEngineTest is Test {
 
         uint256 endingHealthFactor = s_engine.getHealthFactor(USER);
         assertGt(endingHealthFactor, startingHealthFactor);
-        assertEq(s_engine.getStableCoinMinted(USER), 8_000e18);
+        assertApproxEqAbs(s_engine.getStableCoinMinted(USER), debtBeforeLiquidation - 1_000e18, 1);
         assertEq(s_weth.balanceOf(LIQUIDATOR), 1.1 ether);
     }
 

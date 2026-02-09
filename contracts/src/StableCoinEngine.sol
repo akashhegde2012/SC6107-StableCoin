@@ -15,6 +15,8 @@ import {LiquidationAuction} from "./LiquidationAuction.sol";
  * @dev Uses Chainlink feeds via OracleLib stale checks for all price reads.
  */
 contract StableCoinEngine is ReentrancyGuard {
+    using OracleLib for AggregatorV3Interface;
+
     error StableCoinEngine__ArrayLengthMismatch();
     error StableCoinEngine__ZeroAddress();
     error StableCoinEngine__AmountMustBeMoreThanZero();
@@ -63,6 +65,10 @@ contract StableCoinEngine is ReentrancyGuard {
         uint256 stableCoinBurned,
         uint256 collateralReturned
     );
+    event ProtocolRevenueAccrued(uint256 revenueAccrued, uint256 protocolReserve, uint256 protocolBadDebt);
+    event BadDebtSocialized(
+        uint256 indexed auctionId, address indexed user, uint256 badDebt, uint256 reserveUsed, uint256 deficitIncrease
+    );
 
     struct PendingLiquidationAuction {
         address user;
@@ -108,6 +114,9 @@ contract StableCoinEngine is ReentrancyGuard {
     uint256 private s_rate;
     uint256 private s_lastStabilityFeeTimestamp;
     uint256 private s_currentStabilityFeeBps;
+    uint256 private s_totalNormalizedDebt;
+    uint256 private s_protocolReserve;
+    uint256 private s_protocolBadDebt;
 
     address[] private s_collateralTokens;
     StableCoin private immutable i_stableCoin;
@@ -188,6 +197,8 @@ contract StableCoinEngine is ReentrancyGuard {
         if (!success) {
             revert StableCoinEngine__TransferFailed();
         }
+
+        _syncCollateralOraclesForUser(msg.sender);
     }
 
     function redeemCollateral(address tokenCollateralAddress, uint256 amountCollateral)
@@ -207,7 +218,8 @@ contract StableCoinEngine is ReentrancyGuard {
         _syncCollateralOraclesForUser(msg.sender);
 
         uint256 currentDebt = _debtFromNormalized(s_normalizedDebt[msg.sender], currentRate);
-        s_normalizedDebt[msg.sender] = _toNormalizedDebt(currentDebt + amountStableCoinToMint, currentRate);
+        uint256 updatedNormalizedDebt = _toNormalizedDebt(currentDebt + amountStableCoinToMint, currentRate);
+        _setNormalizedDebt(msg.sender, updatedNormalizedDebt);
         _revertIfHealthFactorIsBroken(msg.sender, currentRate);
 
         bool minted = i_stableCoin.mint(msg.sender, amountStableCoinToMint);
@@ -309,14 +321,36 @@ contract StableCoinEngine is ReentrancyGuard {
             s_collateralDeposited[pendingAuction.user][pendingAuction.tokenCollateralAddress] += collateralToReturn;
         }
 
-        if (stableCoinToBurn > 0) {
-            uint256 currentRate = _accrueStabilityFee();
-            uint256 mintedAmount = _debtFromNormalized(s_normalizedDebt[pendingAuction.user], currentRate);
-            if (mintedAmount < stableCoinToBurn) {
-                revert StableCoinEngine__AuctionBurnExceedsDebt(stableCoinToBurn, mintedAmount);
+        uint256 currentRate = _accrueStabilityFee();
+        uint256 mintedAmount = _debtFromNormalized(s_normalizedDebt[pendingAuction.user], currentRate);
+        if (mintedAmount < stableCoinToBurn) {
+            revert StableCoinEngine__AuctionBurnExceedsDebt(stableCoinToBurn, mintedAmount);
+        }
+        if (mintedAmount < pendingAuction.debtToCover) {
+            revert StableCoinEngine__InvalidAuctionSettlement();
+        }
+
+        uint256 badDebt = pendingAuction.debtToCover - stableCoinToBurn;
+        uint256 reserveUsed;
+        uint256 deficitIncrease;
+        if (badDebt > 0) {
+            reserveUsed = badDebt > s_protocolReserve ? s_protocolReserve : badDebt;
+            if (reserveUsed > 0) {
+                s_protocolReserve -= reserveUsed;
             }
 
-            s_normalizedDebt[pendingAuction.user] = _toNormalizedDebt(mintedAmount - stableCoinToBurn, currentRate);
+            deficitIncrease = badDebt - reserveUsed;
+            if (deficitIncrease > 0) {
+                s_protocolBadDebt += deficitIncrease;
+            }
+
+            emit BadDebtSocialized(auctionId, pendingAuction.user, badDebt, reserveUsed, deficitIncrease);
+        }
+
+        uint256 updatedNormalizedDebt = _toNormalizedDebt(mintedAmount - pendingAuction.debtToCover, currentRate);
+        _setNormalizedDebt(pendingAuction.user, updatedNormalizedDebt);
+
+        if (stableCoinToBurn > 0) {
             i_stableCoin.burn(address(this), stableCoinToBurn);
             emit StableCoinBurned(pendingAuction.user, stableCoinToBurn);
         }
@@ -446,11 +480,19 @@ contract StableCoinEngine is ReentrancyGuard {
     }
 
     function getCurrentStabilityFeeBps() external view returns (uint256) {
-        return _targetStabilityFeeBps();
+        return _targetStabilityFeeBps(_peekStableCoinPrice());
     }
 
     function getAppliedStabilityFeeBps() external view returns (uint256) {
         return s_currentStabilityFeeBps;
+    }
+
+    function getProtocolReserve() external view returns (uint256) {
+        return s_protocolReserve;
+    }
+
+    function getProtocolBadDebt() external view returns (uint256) {
+        return s_protocolBadDebt;
     }
 
     function getLastStabilityFeeTimestamp() external view returns (uint256) {
@@ -515,7 +557,8 @@ contract StableCoinEngine is ReentrancyGuard {
             );
         }
 
-        s_normalizedDebt[onBehalfOf] = _toNormalizedDebt(mintedAmount - amountStableCoinToBurn, rate);
+        uint256 updatedNormalizedDebt = _toNormalizedDebt(mintedAmount - amountStableCoinToBurn, rate);
+        _setNormalizedDebt(onBehalfOf, updatedNormalizedDebt);
         i_stableCoin.burn(stableCoinFrom, amountStableCoinToBurn);
 
         emit StableCoinBurned(onBehalfOf, amountStableCoinToBurn);
@@ -575,22 +618,85 @@ contract StableCoinEngine is ReentrancyGuard {
         }
     }
 
+    function _syncCollateralOraclesForUser(address user) internal {
+        OracleLib.OracleConfig memory oracleConfig = _oracleConfig();
+
+        for (uint256 i = 0; i < s_collateralTokens.length; i++) {
+            address tokenCollateralAddress = s_collateralTokens[i];
+            if (s_collateralDeposited[user][tokenCollateralAddress] == 0) {
+                continue;
+            }
+
+            OracleLib.readValidatedPrice(
+                AggregatorV3Interface(s_priceFeeds[tokenCollateralAddress]),
+                s_collateralOracleStates[tokenCollateralAddress],
+                oracleConfig
+            );
+        }
+    }
+
+    function _peekCollateralPrice(address tokenCollateralAddress) internal view returns (uint256) {
+        return OracleLib.peekValidatedPrice(
+            AggregatorV3Interface(s_priceFeeds[tokenCollateralAddress]),
+            s_collateralOracleStates[tokenCollateralAddress],
+            _oracleConfig()
+        );
+    }
+
     function _accrueStabilityFee() internal returns (uint256 updatedRate) {
         updatedRate = s_rate;
+        uint256 previousRate = updatedRate;
         uint256 timeElapsed = block.timestamp - s_lastStabilityFeeTimestamp;
         if (timeElapsed == 0) {
             return updatedRate;
         }
 
-        uint256 annualizedFeeBps = _targetStabilityFeeBps();
+        uint256 annualizedFeeBps = _targetStabilityFeeBps(_readStableCoinPrice());
         s_currentStabilityFeeBps = annualizedFeeBps;
 
         uint256 rateIncrease = (updatedRate * annualizedFeeBps * timeElapsed) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
         updatedRate += rateIncrease;
 
+        if (rateIncrease > 0 && s_totalNormalizedDebt > 0) {
+            uint256 debtBeforeAccrual = _debtFromNormalized(s_totalNormalizedDebt, previousRate);
+            uint256 debtAfterAccrual = _debtFromNormalized(s_totalNormalizedDebt, updatedRate);
+            uint256 protocolRevenue = debtAfterAccrual - debtBeforeAccrual;
+            if (protocolRevenue > 0) {
+                _recordProtocolRevenue(protocolRevenue);
+                emit ProtocolRevenueAccrued(protocolRevenue, s_protocolReserve, s_protocolBadDebt);
+            }
+        }
+
         s_rate = updatedRate;
         s_lastStabilityFeeTimestamp = block.timestamp;
         emit StabilityFeeAccrued(annualizedFeeBps, updatedRate, timeElapsed);
+    }
+
+    function _setNormalizedDebt(address user, uint256 updatedNormalizedDebt) internal {
+        uint256 previousNormalizedDebt = s_normalizedDebt[user];
+        s_normalizedDebt[user] = updatedNormalizedDebt;
+
+        if (updatedNormalizedDebt >= previousNormalizedDebt) {
+            s_totalNormalizedDebt += updatedNormalizedDebt - previousNormalizedDebt;
+            return;
+        }
+
+        s_totalNormalizedDebt -= previousNormalizedDebt - updatedNormalizedDebt;
+    }
+
+    function _recordProtocolRevenue(uint256 protocolRevenue) internal {
+        uint256 remainingRevenue = protocolRevenue;
+        uint256 protocolBadDebt = s_protocolBadDebt;
+
+        if (protocolBadDebt > 0) {
+            uint256 badDebtCovered = remainingRevenue > protocolBadDebt ? protocolBadDebt : remainingRevenue;
+            s_protocolBadDebt = protocolBadDebt - badDebtCovered;
+            remainingRevenue -= badDebtCovered;
+        }
+
+        if (remainingRevenue > 0) {
+            s_protocolReserve += remainingRevenue;
+        }
     }
 
     function _previewRate() internal view returns (uint256) {
@@ -600,13 +706,12 @@ contract StableCoinEngine is ReentrancyGuard {
             return updatedRate;
         }
 
-        uint256 annualizedFeeBps = _targetStabilityFeeBps();
+        uint256 annualizedFeeBps = _targetStabilityFeeBps(_peekStableCoinPrice());
         uint256 rateIncrease = (updatedRate * annualizedFeeBps * timeElapsed) / (BPS_DENOMINATOR * SECONDS_PER_YEAR);
         return updatedRate + rateIncrease;
     }
 
-    function _targetStabilityFeeBps() internal view returns (uint256) {
-        uint256 stableCoinPrice = _stableCoinPrice();
+    function _targetStabilityFeeBps(uint256 stableCoinPrice) internal pure returns (uint256) {
 
         if (stableCoinPrice < PEG_PRICE) {
             uint256 deviationBps = ((PEG_PRICE - stableCoinPrice) * BPS_DENOMINATOR) / PEG_PRICE;
@@ -639,18 +744,21 @@ contract StableCoinEngine is ReentrancyGuard {
         return reducedFeeBps;
     }
 
-    function _stableCoinPrice() internal view returns (uint256 normalizedPrice) {
-        (, int256 price,,,) = i_stableCoinPriceFeed.staleCheckLatestRoundData();
-        if (price <= 0) {
-            revert StableCoinEngine__InvalidPrice();
-        }
+    function _readStableCoinPrice() internal returns (uint256) {
+        return OracleLib.readValidatedPrice(i_stableCoinPriceFeed, s_stableCoinOracleState, _oracleConfig());
+    }
 
-        uint8 feedDecimals = i_stableCoinPriceFeed.decimals();
-        if (feedDecimals > 18) {
-            normalizedPrice = uint256(price) / (10 ** (feedDecimals - 18));
-        } else {
-            normalizedPrice = uint256(price) * (10 ** (18 - feedDecimals));
-        }
+    function _peekStableCoinPrice() internal view returns (uint256) {
+        return OracleLib.peekValidatedPrice(i_stableCoinPriceFeed, s_stableCoinOracleState, _oracleConfig());
+    }
+
+    function _oracleConfig() internal pure returns (OracleLib.OracleConfig memory) {
+        return OracleLib.OracleConfig({
+            maxDeviationBps: ORACLE_MAX_DEVIATION_BPS,
+            shortCircuitBreakerWindow: ORACLE_CIRCUIT_BREAKER_WINDOW,
+            circuitBreakerResetWindow: ORACLE_CIRCUIT_BREAKER_RESET,
+            twapWindow: ORACLE_TWAP_WINDOW
+        });
     }
 
     function _toNormalizedDebt(uint256 debtAmount, uint256 rate) internal pure returns (uint256) {

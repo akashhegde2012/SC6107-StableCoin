@@ -16,8 +16,6 @@ import {OracleLib} from "./libraries/OracleLib.sol";
  * @dev Requires MINTER_ROLE and BURNER_ROLE on StableCoin for this contract.
  */
 contract PSM is ReentrancyGuard {
-    using OracleLib for AggregatorV3Interface;
-
     error PSM__ArrayLengthMismatch();
     error PSM__ZeroAddress();
     error PSM__AmountMustBeMoreThanZero();
@@ -56,9 +54,14 @@ contract PSM is ReentrancyGuard {
     uint256 private constant BPS_DENOMINATOR = 10_000;
     uint256 private constant PEG_LOWER_BOUND = 99e16; // 0.99 USD
     uint256 private constant PEG_UPPER_BOUND = 101e16; // 1.01 USD
+    uint256 private constant ORACLE_MAX_DEVIATION_BPS = 3_000; // 30%
+    uint256 private constant ORACLE_CIRCUIT_BREAKER_WINDOW = 30 minutes;
+    uint256 private constant ORACLE_CIRCUIT_BREAKER_RESET = 1 hours;
+    uint256 private constant ORACLE_TWAP_WINDOW = 30 minutes;
 
     StableCoin private immutable i_stableCoin;
     mapping(address => TokenConfig) private s_tokenConfigs;
+    mapping(address => OracleLib.OracleState) private s_oracleStates;
     address[] private s_supportedCollateralTokens;
 
     modifier moreThanZero(uint256 amount) {
@@ -201,26 +204,40 @@ contract PSM is ReentrancyGuard {
         return s_supportedCollateralTokens;
     }
 
-    function _checkPeg(address collateralToken) internal view {
-        uint256 normalizedPrice = _getNormalizedPrice(collateralToken);
+    function _checkPeg(address collateralToken) internal {
+        uint256 normalizedPrice = _readNormalizedPrice(collateralToken);
         if (normalizedPrice < PEG_LOWER_BOUND || normalizedPrice > PEG_UPPER_BOUND) {
             revert PSM__PegOutOfBounds(collateralToken, normalizedPrice);
         }
     }
 
     function _getNormalizedPrice(address collateralToken) internal view returns (uint256 normalizedPrice) {
-        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_tokenConfigs[collateralToken].priceFeed);
-        (, int256 price,,,) = priceFeed.staleCheckLatestRoundData();
-        if (price <= 0) {
-            revert PSM__InvalidPrice();
-        }
+        return _peekNormalizedPrice(collateralToken);
+    }
 
-        uint8 feedDecimals = priceFeed.decimals();
-        if (feedDecimals > 18) {
-            normalizedPrice = uint256(price) / (10 ** (feedDecimals - 18));
-        } else {
-            normalizedPrice = uint256(price) * (10 ** (18 - feedDecimals));
-        }
+    function _readNormalizedPrice(address collateralToken) internal returns (uint256) {
+        return OracleLib.readValidatedPrice(
+            AggregatorV3Interface(s_tokenConfigs[collateralToken].priceFeed),
+            s_oracleStates[collateralToken],
+            _oracleConfig()
+        );
+    }
+
+    function _peekNormalizedPrice(address collateralToken) internal view returns (uint256 normalizedPrice) {
+        return OracleLib.peekValidatedPrice(
+            AggregatorV3Interface(s_tokenConfigs[collateralToken].priceFeed),
+            s_oracleStates[collateralToken],
+            _oracleConfig()
+        );
+    }
+
+    function _oracleConfig() internal pure returns (OracleLib.OracleConfig memory) {
+        return OracleLib.OracleConfig({
+            maxDeviationBps: ORACLE_MAX_DEVIATION_BPS,
+            shortCircuitBreakerWindow: ORACLE_CIRCUIT_BREAKER_WINDOW,
+            circuitBreakerResetWindow: ORACLE_CIRCUIT_BREAKER_RESET,
+            twapWindow: ORACLE_TWAP_WINDOW
+        });
     }
 
     function _calculateFee(uint256 amount, uint16 feeBps) internal pure returns (uint256) {

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AggregatorV3Interface} from "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {StableCoin} from "./StableCoin.sol";
@@ -14,7 +15,7 @@ import {LiquidationAuction} from "./LiquidationAuction.sol";
  * @notice Core logic for collateralized debt positions and liquidation flow.
  * @dev Uses Chainlink feeds via OracleLib stale checks for all price reads.
  */
-contract StableCoinEngine is ReentrancyGuard {
+contract StableCoinEngine is ReentrancyGuard, Pausable {
     using OracleLib for AggregatorV3Interface;
 
     error StableCoinEngine__ArrayLengthMismatch();
@@ -69,6 +70,11 @@ contract StableCoinEngine is ReentrancyGuard {
     event BadDebtSocialized(
         uint256 indexed auctionId, address indexed user, uint256 badDebt, uint256 reserveUsed, uint256 deficitIncrease
     );
+    event LiquidationThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
+    event LiquidationBonusUpdated(uint256 oldBonus, uint256 newBonus);
+    event StabilityFeeSensitivityUpdated(uint256 belowPeg, uint256 abovePeg);
+    event StabilityFeeCapsUpdated(uint256 minFee, uint256 maxFee);
+    event BaseStabilityFeeUpdated(uint256 oldFee, uint256 newFee);
 
     struct PendingLiquidationAuction {
         address user;
@@ -89,19 +95,19 @@ contract StableCoinEngine is ReentrancyGuard {
     uint256 private constant ORACLE_CIRCUIT_BREAKER_RESET = 1 hours;
     uint256 private constant ORACLE_TWAP_WINDOW = 30 minutes;
 
-    uint256 private constant BASE_STABILITY_FEE_BPS = 200; // 2.00%
-    uint256 private constant MIN_STABILITY_FEE_BPS = 0;
-    uint256 private constant MAX_STABILITY_FEE_BPS = 2_500; // 25.00%
-    uint256 private constant PEG_DEVIATION_DEADBAND_BPS = 10; // 0.10%
-    uint256 private constant BELOW_PEG_FEE_SENSITIVITY = 3;
-    uint256 private constant ABOVE_PEG_FEE_SENSITIVITY = 2;
-
-    uint256 private constant LIQUIDATION_THRESHOLD = 50;
+    uint256 private s_liquidationThreshold = 50;
     uint256 private constant LIQUIDATION_PRECISION = 100;
     uint256 private constant MIN_HEALTH_FACTOR = 1e18;
-    uint256 private constant LIQUIDATION_BONUS = 10;
+    uint256 private s_liquidationBonus = 10;
     uint256 private constant LIQUIDATION_AUCTION_DURATION = 2 hours;
     uint256 private constant LIQUIDATION_AUCTION_MIN_OPENING_BID_BPS = 8_000; // 80%
+
+    uint256 private s_baseStabilityFeeBps = 200; // 2.00%
+    uint256 private s_minStabilityFeeBps = 0;
+    uint256 private s_maxStabilityFeeBps = 2_500; // 25.00%
+    uint256 private constant PEG_DEVIATION_DEADBAND_BPS = 10; // 0.10%
+    uint256 private s_belowPegFeeSensitivity = 3;
+    uint256 private s_abovePegFeeSensitivity = 2;
 
     mapping(address => address) private s_priceFeeds;
     mapping(address => OracleLib.OracleState) private s_collateralOracleStates;
@@ -166,7 +172,49 @@ contract StableCoinEngine is ReentrancyGuard {
 
         s_rate = RAY;
         s_lastStabilityFeeTimestamp = block.timestamp;
-        s_currentStabilityFeeBps = BASE_STABILITY_FEE_BPS;
+        s_currentStabilityFeeBps = s_baseStabilityFeeBps;
+    }
+
+    modifier onlyAdmin() {
+        if (!i_stableCoin.hasRole(i_stableCoin.DEFAULT_ADMIN_ROLE(), msg.sender)) {
+            revert StableCoinEngine__Unauthorized();
+        }
+        _;
+    }
+
+    function pause() external onlyAdmin {
+        _pause();
+    }
+
+    function unpause() external onlyAdmin {
+        _unpause();
+    }
+
+    function setLiquidationThreshold(uint256 newThreshold) external onlyAdmin {
+        emit LiquidationThresholdUpdated(s_liquidationThreshold, newThreshold);
+        s_liquidationThreshold = newThreshold;
+    }
+
+    function setLiquidationBonus(uint256 newBonus) external onlyAdmin {
+        emit LiquidationBonusUpdated(s_liquidationBonus, newBonus);
+        s_liquidationBonus = newBonus;
+    }
+
+    function setStabilityFeeSensitivity(uint256 belowPeg, uint256 abovePeg) external onlyAdmin {
+        emit StabilityFeeSensitivityUpdated(belowPeg, abovePeg);
+        s_belowPegFeeSensitivity = belowPeg;
+        s_abovePegFeeSensitivity = abovePeg;
+    }
+
+    function setStabilityFeeCaps(uint256 minFee, uint256 maxFee) external onlyAdmin {
+        emit StabilityFeeCapsUpdated(minFee, maxFee);
+        s_minStabilityFeeBps = minFee;
+        s_maxStabilityFeeBps = maxFee;
+    }
+
+    function setBaseStabilityFee(uint256 newFee) external onlyAdmin {
+        emit BaseStabilityFeeUpdated(s_baseStabilityFeeBps, newFee);
+        s_baseStabilityFeeBps = newFee;
     }
 
     function setLiquidationAuction(address liquidationAuction) external {
@@ -188,6 +236,7 @@ contract StableCoinEngine is ReentrancyGuard {
         external
         moreThanZero(amountCollateral)
         isAllowedToken(tokenCollateralAddress)
+        whenNotPaused
         nonReentrant
     {
         s_collateralDeposited[msg.sender][tokenCollateralAddress] += amountCollateral;
@@ -205,6 +254,7 @@ contract StableCoinEngine is ReentrancyGuard {
         external
         moreThanZero(amountCollateral)
         isAllowedToken(tokenCollateralAddress)
+        whenNotPaused
         nonReentrant
     {
         uint256 currentRate = _accrueStabilityFee();
@@ -213,7 +263,7 @@ contract StableCoinEngine is ReentrancyGuard {
         _revertIfHealthFactorIsBroken(msg.sender, currentRate);
     }
 
-    function mintStableCoin(uint256 amountStableCoinToMint) external moreThanZero(amountStableCoinToMint) nonReentrant {
+    function mintStableCoin(uint256 amountStableCoinToMint) external moreThanZero(amountStableCoinToMint) whenNotPaused nonReentrant {
         uint256 currentRate = _accrueStabilityFee();
         _syncCollateralOraclesForUser(msg.sender);
 
@@ -230,7 +280,7 @@ contract StableCoinEngine is ReentrancyGuard {
         emit StableCoinMinted(msg.sender, amountStableCoinToMint);
     }
 
-    function burnStableCoin(uint256 amount) external moreThanZero(amount) nonReentrant {
+    function burnStableCoin(uint256 amount) external moreThanZero(amount) whenNotPaused nonReentrant {
         uint256 currentRate = _accrueStabilityFee();
         _syncCollateralOraclesForUser(msg.sender);
         _burnStableCoin(amount, msg.sender, msg.sender, currentRate);
@@ -241,6 +291,7 @@ contract StableCoinEngine is ReentrancyGuard {
         external
         moreThanZero(debtToCover)
         isAllowedToken(tokenCollateralAddress)
+        whenNotPaused
         nonReentrant
     {
         if (address(s_liquidationAuction) == address(0)) {
@@ -459,12 +510,12 @@ contract StableCoinEngine is ReentrancyGuard {
         );
     }
 
-    function getLiquidationThreshold() external pure returns (uint256) {
-        return LIQUIDATION_THRESHOLD;
+    function getLiquidationThreshold() external view returns (uint256) {
+        return s_liquidationThreshold;
     }
 
-    function getLiquidationBonus() external pure returns (uint256) {
-        return LIQUIDATION_BONUS;
+    function getLiquidationBonus() external view returns (uint256) {
+        return s_liquidationBonus;
     }
 
     function getMinHealthFactor() external pure returns (uint256) {
@@ -499,16 +550,16 @@ contract StableCoinEngine is ReentrancyGuard {
         return s_lastStabilityFeeTimestamp;
     }
 
-    function getBaseStabilityFeeBps() external pure returns (uint256) {
-        return BASE_STABILITY_FEE_BPS;
+    function getBaseStabilityFeeBps() external view returns (uint256) {
+        return s_baseStabilityFeeBps;
     }
 
-    function getMinStabilityFeeBps() external pure returns (uint256) {
-        return MIN_STABILITY_FEE_BPS;
+    function getMinStabilityFeeBps() external view returns (uint256) {
+        return s_minStabilityFeeBps;
     }
 
-    function getMaxStabilityFeeBps() external pure returns (uint256) {
-        return MAX_STABILITY_FEE_BPS;
+    function getMaxStabilityFeeBps() external view returns (uint256) {
+        return s_maxStabilityFeeBps;
     }
 
     function getPegPrice() external pure returns (uint256) {
@@ -540,7 +591,7 @@ contract StableCoinEngine is ReentrancyGuard {
         returns (uint256)
     {
         uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(tokenCollateralAddress, debtToCover);
-        uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+        uint256 bonusCollateral = (tokenAmountFromDebtCovered * s_liquidationBonus) / LIQUIDATION_PRECISION;
         return tokenAmountFromDebtCovered + bonusCollateral;
     }
 
@@ -595,7 +646,7 @@ contract StableCoinEngine is ReentrancyGuard {
 
     function _calculateHealthFactor(uint256 totalStableCoinMinted, uint256 collateralValueInUsd)
         internal
-        pure
+        view
         returns (uint256)
     {
         if (totalStableCoinMinted == 0) {
@@ -603,7 +654,7 @@ contract StableCoinEngine is ReentrancyGuard {
         }
 
         uint256 collateralAdjustedForThreshold =
-            (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
+            (collateralValueInUsd * s_liquidationThreshold) / LIQUIDATION_PRECISION;
         return (collateralAdjustedForThreshold * PRECISION) / totalStableCoinMinted;
     }
 
@@ -711,35 +762,35 @@ contract StableCoinEngine is ReentrancyGuard {
         return updatedRate + rateIncrease;
     }
 
-    function _targetStabilityFeeBps(uint256 stableCoinPrice) internal pure returns (uint256) {
+    function _targetStabilityFeeBps(uint256 stableCoinPrice) internal view returns (uint256) {
 
         if (stableCoinPrice < PEG_PRICE) {
             uint256 deviationBps = ((PEG_PRICE - stableCoinPrice) * BPS_DENOMINATOR) / PEG_PRICE;
             if (deviationBps <= PEG_DEVIATION_DEADBAND_BPS) {
-                return BASE_STABILITY_FEE_BPS;
+                return s_baseStabilityFeeBps;
             }
 
             uint256 adjustedFeeBps =
-                BASE_STABILITY_FEE_BPS + ((deviationBps - PEG_DEVIATION_DEADBAND_BPS) * BELOW_PEG_FEE_SENSITIVITY);
-            if (adjustedFeeBps > MAX_STABILITY_FEE_BPS) {
-                return MAX_STABILITY_FEE_BPS;
+                s_baseStabilityFeeBps + ((deviationBps - PEG_DEVIATION_DEADBAND_BPS) * s_belowPegFeeSensitivity);
+            if (adjustedFeeBps > s_maxStabilityFeeBps) {
+                return s_maxStabilityFeeBps;
             }
             return adjustedFeeBps;
         }
 
         uint256 positiveDeviationBps = ((stableCoinPrice - PEG_PRICE) * BPS_DENOMINATOR) / PEG_PRICE;
         if (positiveDeviationBps <= PEG_DEVIATION_DEADBAND_BPS) {
-            return BASE_STABILITY_FEE_BPS;
+            return s_baseStabilityFeeBps;
         }
 
-        uint256 feeReduction = (positiveDeviationBps - PEG_DEVIATION_DEADBAND_BPS) * ABOVE_PEG_FEE_SENSITIVITY;
-        if (feeReduction >= BASE_STABILITY_FEE_BPS) {
-            return MIN_STABILITY_FEE_BPS;
+        uint256 feeReduction = (positiveDeviationBps - PEG_DEVIATION_DEADBAND_BPS) * s_abovePegFeeSensitivity;
+        if (feeReduction >= s_baseStabilityFeeBps) {
+            return s_minStabilityFeeBps;
         }
 
-        uint256 reducedFeeBps = BASE_STABILITY_FEE_BPS - feeReduction;
-        if (reducedFeeBps < MIN_STABILITY_FEE_BPS) {
-            return MIN_STABILITY_FEE_BPS;
+        uint256 reducedFeeBps = s_baseStabilityFeeBps - feeReduction;
+        if (reducedFeeBps < s_minStabilityFeeBps) {
+            return s_minStabilityFeeBps;
         }
         return reducedFeeBps;
     }

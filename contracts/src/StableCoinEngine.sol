@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AggregatorV3Interface} from "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {StableCoin} from "./StableCoin.sol";
 import {OracleLib} from "./libraries/OracleLib.sol";
+import {LiquidationAuction} from "./LiquidationAuction.sol";
 
 /**
  * @title StableCoinEngine
@@ -14,8 +15,6 @@ import {OracleLib} from "./libraries/OracleLib.sol";
  * @dev Uses Chainlink feeds via OracleLib stale checks for all price reads.
  */
 contract StableCoinEngine is ReentrancyGuard {
-    using OracleLib for AggregatorV3Interface;
-
     error StableCoinEngine__ArrayLengthMismatch();
     error StableCoinEngine__ZeroAddress();
     error StableCoinEngine__AmountMustBeMoreThanZero();
@@ -28,6 +27,16 @@ contract StableCoinEngine is ReentrancyGuard {
     error StableCoinEngine__InsufficientCollateral();
     error StableCoinEngine__BurnAmountExceedsMinted(uint256 burnAmount, uint256 mintedAmount);
     error StableCoinEngine__InvalidPrice();
+    error StableCoinEngine__Unauthorized();
+    error StableCoinEngine__LiquidationAuctionNotConfigured();
+    error StableCoinEngine__LiquidationAuctionAlreadyConfigured();
+    error StableCoinEngine__OnlyLiquidationAuction();
+    error StableCoinEngine__ActiveLiquidationAuctionExists(address user, address tokenCollateralAddress);
+    error StableCoinEngine__DebtReservedForAuction(uint256 reservedDebt, uint256 burnAmount);
+    error StableCoinEngine__DebtNotAvailableForLiquidation(uint256 availableDebt, uint256 requestedDebt);
+    error StableCoinEngine__AuctionNotActive(uint256 auctionId);
+    error StableCoinEngine__InvalidAuctionSettlement();
+    error StableCoinEngine__AuctionBurnExceedsDebt(uint256 burnAmount, uint256 mintedAmount);
 
     event CollateralDeposited(address indexed user, address indexed tokenCollateralAddress, uint256 amountCollateral);
     event CollateralRedeemed(
@@ -39,13 +48,40 @@ contract StableCoinEngine is ReentrancyGuard {
     event StableCoinMinted(address indexed user, uint256 amount);
     event StableCoinBurned(address indexed user, uint256 amount);
     event StabilityFeeAccrued(uint256 annualizedFeeBps, uint256 updatedRate, uint256 timeElapsed);
+    event LiquidationAuctionConfigured(address indexed liquidationAuction);
+    event LiquidationAuctionStarted(
+        uint256 indexed auctionId,
+        address indexed user,
+        address indexed tokenCollateralAddress,
+        uint256 debtToCover,
+        uint256 collateralAmount
+    );
+    event LiquidationAuctionSettled(
+        uint256 indexed auctionId,
+        address indexed user,
+        address indexed tokenCollateralAddress,
+        uint256 stableCoinBurned,
+        uint256 collateralReturned
+    );
 
-    uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
+    struct PendingLiquidationAuction {
+        address user;
+        address tokenCollateralAddress;
+        uint256 debtToCover;
+        uint256 collateralAmount;
+        bool active;
+    }
+
     uint256 private constant PRECISION = 1e18;
     uint256 private constant RAY = 1e27;
     uint256 private constant BPS_DENOMINATOR = 10_000;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
     uint256 private constant PEG_PRICE = 1e18;
+
+    uint256 private constant ORACLE_MAX_DEVIATION_BPS = 3_000; // 30%
+    uint256 private constant ORACLE_CIRCUIT_BREAKER_WINDOW = 30 minutes;
+    uint256 private constant ORACLE_CIRCUIT_BREAKER_RESET = 1 hours;
+    uint256 private constant ORACLE_TWAP_WINDOW = 30 minutes;
 
     uint256 private constant BASE_STABILITY_FEE_BPS = 200; // 2.00%
     uint256 private constant MIN_STABILITY_FEE_BPS = 0;
@@ -58,10 +94,16 @@ contract StableCoinEngine is ReentrancyGuard {
     uint256 private constant LIQUIDATION_PRECISION = 100;
     uint256 private constant MIN_HEALTH_FACTOR = 1e18;
     uint256 private constant LIQUIDATION_BONUS = 10;
+    uint256 private constant LIQUIDATION_AUCTION_DURATION = 2 hours;
+    uint256 private constant LIQUIDATION_AUCTION_MIN_OPENING_BID_BPS = 8_000; // 80%
 
     mapping(address => address) private s_priceFeeds;
+    mapping(address => OracleLib.OracleState) private s_collateralOracleStates;
     mapping(address => mapping(address => uint256)) private s_collateralDeposited;
     mapping(address => uint256) private s_normalizedDebt;
+    mapping(address => uint256) private s_debtReservedForAuction;
+    mapping(address => mapping(address => bool)) private s_hasActiveLiquidationAuction;
+    mapping(uint256 => PendingLiquidationAuction) private s_pendingLiquidationAuctions;
 
     uint256 private s_rate;
     uint256 private s_lastStabilityFeeTimestamp;
@@ -70,6 +112,8 @@ contract StableCoinEngine is ReentrancyGuard {
     address[] private s_collateralTokens;
     StableCoin private immutable i_stableCoin;
     AggregatorV3Interface private immutable i_stableCoinPriceFeed;
+    OracleLib.OracleState private s_stableCoinOracleState;
+    LiquidationAuction private s_liquidationAuction;
 
     modifier moreThanZero(uint256 amount) {
         if (amount == 0) {
@@ -116,6 +160,21 @@ contract StableCoinEngine is ReentrancyGuard {
         s_currentStabilityFeeBps = BASE_STABILITY_FEE_BPS;
     }
 
+    function setLiquidationAuction(address liquidationAuction) external {
+        if (!i_stableCoin.hasRole(i_stableCoin.DEFAULT_ADMIN_ROLE(), msg.sender)) {
+            revert StableCoinEngine__Unauthorized();
+        }
+        if (liquidationAuction == address(0)) {
+            revert StableCoinEngine__ZeroAddress();
+        }
+        if (address(s_liquidationAuction) != address(0)) {
+            revert StableCoinEngine__LiquidationAuctionAlreadyConfigured();
+        }
+
+        s_liquidationAuction = LiquidationAuction(liquidationAuction);
+        emit LiquidationAuctionConfigured(liquidationAuction);
+    }
+
     function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
         external
         moreThanZero(amountCollateral)
@@ -138,12 +197,14 @@ contract StableCoinEngine is ReentrancyGuard {
         nonReentrant
     {
         uint256 currentRate = _accrueStabilityFee();
+        _syncCollateralOraclesForUser(msg.sender);
         _redeemCollateral(tokenCollateralAddress, amountCollateral, msg.sender, msg.sender);
         _revertIfHealthFactorIsBroken(msg.sender, currentRate);
     }
 
     function mintStableCoin(uint256 amountStableCoinToMint) external moreThanZero(amountStableCoinToMint) nonReentrant {
         uint256 currentRate = _accrueStabilityFee();
+        _syncCollateralOraclesForUser(msg.sender);
 
         uint256 currentDebt = _debtFromNormalized(s_normalizedDebt[msg.sender], currentRate);
         s_normalizedDebt[msg.sender] = _toNormalizedDebt(currentDebt + amountStableCoinToMint, currentRate);
@@ -159,6 +220,7 @@ contract StableCoinEngine is ReentrancyGuard {
 
     function burnStableCoin(uint256 amount) external moreThanZero(amount) nonReentrant {
         uint256 currentRate = _accrueStabilityFee();
+        _syncCollateralOraclesForUser(msg.sender);
         _burnStableCoin(amount, msg.sender, msg.sender, currentRate);
         _revertIfHealthFactorIsBroken(msg.sender, currentRate);
     }
@@ -169,24 +231,103 @@ contract StableCoinEngine is ReentrancyGuard {
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
     {
-        uint256 currentRate = _accrueStabilityFee();
+        if (address(s_liquidationAuction) == address(0)) {
+            revert StableCoinEngine__LiquidationAuctionNotConfigured();
+        }
+        if (s_hasActiveLiquidationAuction[user][tokenCollateralAddress]) {
+            revert StableCoinEngine__ActiveLiquidationAuctionExists(user, tokenCollateralAddress);
+        }
 
-        uint256 startingUserHealthFactor = _healthFactor(user, currentRate);
-        if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
+        uint256 currentRate = _accrueStabilityFee();
+        _syncCollateralOraclesForUser(user);
+
+        if (_healthFactor(user, currentRate) >= MIN_HEALTH_FACTOR) {
             revert StableCoinEngine__HealthFactorOk();
         }
 
-        uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(tokenCollateralAddress, debtToCover);
-        uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
-        uint256 totalCollateralToRedeem = tokenAmountFromDebtCovered + bonusCollateral;
-
-        _redeemCollateral(tokenCollateralAddress, totalCollateralToRedeem, user, msg.sender);
-        _burnStableCoin(debtToCover, user, msg.sender, currentRate);
-
-        uint256 endingUserHealthFactor = _healthFactor(user, currentRate);
-        if (endingUserHealthFactor <= startingUserHealthFactor) {
-            revert StableCoinEngine__HealthFactorNotImproved();
+        uint256 reservedDebt = s_debtReservedForAuction[user];
+        {
+            uint256 mintedAmount = _debtFromNormalized(s_normalizedDebt[user], currentRate);
+            uint256 availableDebt = mintedAmount > reservedDebt ? mintedAmount - reservedDebt : 0;
+            if (availableDebt < debtToCover) {
+                revert StableCoinEngine__DebtNotAvailableForLiquidation(availableDebt, debtToCover);
+            }
         }
+
+        uint256 totalCollateralToAuction = _getLiquidationCollateralAmount(tokenCollateralAddress, debtToCover);
+
+        _redeemCollateral(tokenCollateralAddress, totalCollateralToAuction, user, address(s_liquidationAuction));
+
+        uint256 auctionId = _startLiquidationAuction(user, tokenCollateralAddress, debtToCover, totalCollateralToAuction);
+
+        s_pendingLiquidationAuctions[auctionId] = PendingLiquidationAuction({
+            user: user,
+            tokenCollateralAddress: tokenCollateralAddress,
+            debtToCover: debtToCover,
+            collateralAmount: totalCollateralToAuction,
+            active: true
+        });
+        s_hasActiveLiquidationAuction[user][tokenCollateralAddress] = true;
+        s_debtReservedForAuction[user] = reservedDebt + debtToCover;
+
+        emit LiquidationAuctionStarted(auctionId, user, tokenCollateralAddress, debtToCover, totalCollateralToAuction);
+    }
+
+    function finalizeLiquidationAuction(uint256 auctionId) external {
+        if (address(s_liquidationAuction) == address(0)) {
+            revert StableCoinEngine__LiquidationAuctionNotConfigured();
+        }
+        s_liquidationAuction.finalizeAuction(auctionId);
+    }
+
+    function onAuctionSettled(uint256 auctionId, uint256 stableCoinToBurn, uint256 collateralToReturn)
+        external
+        nonReentrant
+    {
+        if (msg.sender != address(s_liquidationAuction)) {
+            revert StableCoinEngine__OnlyLiquidationAuction();
+        }
+
+        PendingLiquidationAuction memory pendingAuction = s_pendingLiquidationAuctions[auctionId];
+        if (!pendingAuction.active) {
+            revert StableCoinEngine__AuctionNotActive(auctionId);
+        }
+        if (stableCoinToBurn > pendingAuction.debtToCover || collateralToReturn > pendingAuction.collateralAmount) {
+            revert StableCoinEngine__InvalidAuctionSettlement();
+        }
+
+        delete s_pendingLiquidationAuctions[auctionId];
+        s_hasActiveLiquidationAuction[pendingAuction.user][pendingAuction.tokenCollateralAddress] = false;
+
+        uint256 reservedDebt = s_debtReservedForAuction[pendingAuction.user];
+        if (reservedDebt < pendingAuction.debtToCover) {
+            revert StableCoinEngine__InvalidAuctionSettlement();
+        }
+        s_debtReservedForAuction[pendingAuction.user] = reservedDebt - pendingAuction.debtToCover;
+
+        if (collateralToReturn > 0) {
+            s_collateralDeposited[pendingAuction.user][pendingAuction.tokenCollateralAddress] += collateralToReturn;
+        }
+
+        if (stableCoinToBurn > 0) {
+            uint256 currentRate = _accrueStabilityFee();
+            uint256 mintedAmount = _debtFromNormalized(s_normalizedDebt[pendingAuction.user], currentRate);
+            if (mintedAmount < stableCoinToBurn) {
+                revert StableCoinEngine__AuctionBurnExceedsDebt(stableCoinToBurn, mintedAmount);
+            }
+
+            s_normalizedDebt[pendingAuction.user] = _toNormalizedDebt(mintedAmount - stableCoinToBurn, currentRate);
+            i_stableCoin.burn(address(this), stableCoinToBurn);
+            emit StableCoinBurned(pendingAuction.user, stableCoinToBurn);
+        }
+
+        emit LiquidationAuctionSettled(
+            auctionId,
+            pendingAuction.user,
+            pendingAuction.tokenCollateralAddress,
+            stableCoinToBurn,
+            collateralToReturn
+        );
     }
 
     function dripStabilityFee() external returns (uint256 updatedRate) {
@@ -215,12 +356,8 @@ contract StableCoinEngine is ReentrancyGuard {
             revert StableCoinEngine__TokenNotAllowed(tokenCollateralAddress);
         }
 
-        (, int256 price,,,) = AggregatorV3Interface(priceFeedAddress).staleCheckLatestRoundData();
-        if (price <= 0) {
-            revert StableCoinEngine__InvalidPrice();
-        }
-
-        return (uint256(price) * ADDITIONAL_FEED_PRECISION * amount) / PRECISION;
+        uint256 validatedPrice = _peekCollateralPrice(tokenCollateralAddress);
+        return (validatedPrice * amount) / PRECISION;
     }
 
     function getTokenAmountFromUsd(address tokenCollateralAddress, uint256 usdAmountInWei) public view returns (uint256) {
@@ -229,12 +366,8 @@ contract StableCoinEngine is ReentrancyGuard {
             revert StableCoinEngine__TokenNotAllowed(tokenCollateralAddress);
         }
 
-        (, int256 price,,,) = AggregatorV3Interface(priceFeedAddress).staleCheckLatestRoundData();
-        if (price <= 0) {
-            revert StableCoinEngine__InvalidPrice();
-        }
-
-        return (usdAmountInWei * PRECISION) / (uint256(price) * ADDITIONAL_FEED_PRECISION);
+        uint256 validatedPrice = _peekCollateralPrice(tokenCollateralAddress);
+        return (usdAmountInWei * PRECISION) / validatedPrice;
     }
 
     function getCollateralBalanceOfUser(address user, address tokenCollateralAddress) external view returns (uint256) {
@@ -263,6 +396,33 @@ contract StableCoinEngine is ReentrancyGuard {
 
     function getStableCoinPriceFeed() external view returns (address) {
         return address(i_stableCoinPriceFeed);
+    }
+
+    function getLiquidationAuctionAddress() external view returns (address) {
+        return address(s_liquidationAuction);
+    }
+
+    function getDebtReservedForAuction(address user) external view returns (uint256) {
+        return s_debtReservedForAuction[user];
+    }
+
+    function hasActiveLiquidationAuction(address user, address tokenCollateralAddress) external view returns (bool) {
+        return s_hasActiveLiquidationAuction[user][tokenCollateralAddress];
+    }
+
+    function getPendingLiquidationAuction(uint256 auctionId)
+        external
+        view
+        returns (address user, address tokenCollateralAddress, uint256 debtToCover, uint256 collateralAmount, bool active)
+    {
+        PendingLiquidationAuction memory pendingAuction = s_pendingLiquidationAuctions[auctionId];
+        return (
+            pendingAuction.user,
+            pendingAuction.tokenCollateralAddress,
+            pendingAuction.debtToCover,
+            pendingAuction.collateralAmount,
+            pendingAuction.active
+        );
     }
 
     function getLiquidationThreshold() external pure returns (uint256) {
@@ -313,12 +473,46 @@ contract StableCoinEngine is ReentrancyGuard {
         return PEG_PRICE;
     }
 
+    function _startLiquidationAuction(address user, address tokenCollateralAddress, uint256 debtToCover, uint256 collateralAmount)
+        internal
+        returns (uint256)
+    {
+        uint256 minimumOpeningBid = (debtToCover * LIQUIDATION_AUCTION_MIN_OPENING_BID_BPS) / BPS_DENOMINATOR;
+        if (minimumOpeningBid == 0) {
+            minimumOpeningBid = 1;
+        }
+
+        return s_liquidationAuction.createAuction(
+            user,
+            tokenCollateralAddress,
+            collateralAmount,
+            debtToCover,
+            minimumOpeningBid,
+            LIQUIDATION_AUCTION_DURATION
+        );
+    }
+
+    function _getLiquidationCollateralAmount(address tokenCollateralAddress, uint256 debtToCover)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(tokenCollateralAddress, debtToCover);
+        uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+        return tokenAmountFromDebtCovered + bonusCollateral;
+    }
+
     function _burnStableCoin(uint256 amountStableCoinToBurn, address onBehalfOf, address stableCoinFrom, uint256 rate)
         internal
     {
         uint256 mintedAmount = _debtFromNormalized(s_normalizedDebt[onBehalfOf], rate);
         if (mintedAmount < amountStableCoinToBurn) {
             revert StableCoinEngine__BurnAmountExceedsMinted(amountStableCoinToBurn, mintedAmount);
+        }
+        if ((mintedAmount - amountStableCoinToBurn) < s_debtReservedForAuction[onBehalfOf]) {
+            revert StableCoinEngine__DebtReservedForAuction(
+                s_debtReservedForAuction[onBehalfOf], amountStableCoinToBurn
+            );
         }
 
         s_normalizedDebt[onBehalfOf] = _toNormalizedDebt(mintedAmount - amountStableCoinToBurn, rate);

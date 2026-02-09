@@ -7,6 +7,7 @@ import {MockV3Aggregator} from "chainlink-brownie-contracts/contracts/src/v0.8/t
 
 import {StableCoin} from "../src/StableCoin.sol";
 import {StableCoinEngine} from "../src/StableCoinEngine.sol";
+import {LiquidationAuction} from "../src/LiquidationAuction.sol";
 
 contract StableCoinEngineTest is Test {
     uint8 private constant FEED_DECIMALS = 8;
@@ -20,6 +21,7 @@ contract StableCoinEngineTest is Test {
 
     StableCoin private s_stableCoin;
     StableCoinEngine private s_engine;
+    LiquidationAuction private s_liquidationAuction;
 
     ERC20Mock private s_weth;
     ERC20Mock private s_wbtc;
@@ -46,6 +48,8 @@ contract StableCoinEngineTest is Test {
         priceFeeds[1] = address(s_wbtcUsdFeed);
 
         s_engine = new StableCoinEngine(collateralTokens, priceFeeds, address(s_stableCoin), address(s_scUsdFeed));
+        s_liquidationAuction = new LiquidationAuction(address(s_stableCoin), address(s_engine));
+        s_engine.setLiquidationAuction(address(s_liquidationAuction));
         s_stableCoin.grantRole(s_stableCoin.MINTER_ROLE(), address(s_engine));
         s_stableCoin.grantRole(s_stableCoin.BURNER_ROLE(), address(s_engine));
     }
@@ -180,7 +184,7 @@ contract StableCoinEngineTest is Test {
         s_engine.liquidate(address(s_weth), USER, 1_000e18);
     }
 
-    function testLiquidateRevertsWhenHealthFactorNotImproved() public {
+    function testLiquidateCreatesAuctionAndReservesDebt() public {
         _depositCollateral(USER, address(s_weth), 10 ether);
         vm.prank(USER);
         s_engine.mintStableCoin(9_500e18);
@@ -192,8 +196,18 @@ contract StableCoinEngineTest is Test {
         s_engine.mintStableCoin(1_000e18);
 
         vm.prank(LIQUIDATOR);
-        vm.expectRevert(StableCoinEngine.StableCoinEngine__HealthFactorNotImproved.selector);
         s_engine.liquidate(address(s_weth), USER, 1_000e18);
+
+        (address auctionUser, address auctionToken, uint256 debtToCover, uint256 collateralAmount, bool active) =
+            s_engine.getPendingLiquidationAuction(0);
+
+        assertEq(auctionUser, USER);
+        assertEq(auctionToken, address(s_weth));
+        assertEq(debtToCover, 1_000e18);
+        assertEq(collateralAmount, 1.1 ether);
+        assertTrue(active);
+        assertEq(s_engine.getDebtReservedForAuction(USER), 1_000e18);
+        assertTrue(s_engine.hasActiveLiquidationAuction(USER, address(s_weth)));
     }
 
     function testLiquidateSuccessImprovesHealthFactorAndTransfersBonusCollateral() public {
@@ -211,6 +225,13 @@ contract StableCoinEngineTest is Test {
 
         vm.prank(LIQUIDATOR);
         s_engine.liquidate(address(s_weth), USER, 1_000e18);
+
+        vm.startPrank(LIQUIDATOR);
+        s_stableCoin.approve(address(s_liquidationAuction), 1_000e18);
+        s_liquidationAuction.placeBid(0, 1_000e18);
+        vm.stopPrank();
+
+        s_engine.finalizeLiquidationAuction(0);
 
         uint256 endingHealthFactor = s_engine.getHealthFactor(USER);
         assertGt(endingHealthFactor, startingHealthFactor);

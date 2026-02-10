@@ -18,20 +18,18 @@ export const anvil = defineChain({
 
 // Contract Addresses (from deployment on Anvil chain 31337)
 export const CONTRACTS = {
-  WETH: (process.env.NEXT_PUBLIC_CONTRACT_WETH ?? '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512') as Address,
-  WBTC: (process.env.NEXT_PUBLIC_CONTRACT_WBTC ?? '0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9') as Address,
-  WETH_PRICE_FEED: (process.env.NEXT_PUBLIC_CONTRACT_WETH_PRICE_FEED ?? '0x5FbDB2315678afecb367f032d93F642f64180aa3') as Address,
-  WBTC_PRICE_FEED: (process.env.NEXT_PUBLIC_CONTRACT_WBTC_PRICE_FEED ?? '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0') as Address,
-  SC_PRICE_FEED: (process.env.NEXT_PUBLIC_CONTRACT_SC_PRICE_FEED ?? '0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9') as Address,
-  STABLE_COIN: (process.env.NEXT_PUBLIC_CONTRACT_STABLE_COIN ?? '0x5FC8d32690cc91D4c39d9d3abcBD16989F875707') as Address,
-  STABLE_COIN_ENGINE: (process.env.NEXT_PUBLIC_CONTRACT_STABLE_COIN_ENGINE ?? '0x0165878A594ca255338adfa4d48449f69242Eb8F') as Address,
+  WETH: process.env.NEXT_PUBLIC_CONTRACT_WETH as Address,
+  WBTC: process.env.NEXT_PUBLIC_CONTRACT_WBTC as Address,
+  WETH_PRICE_FEED: process.env.NEXT_PUBLIC_CONTRACT_WETH_PRICE_FEED as Address,
+  WBTC_PRICE_FEED: process.env.NEXT_PUBLIC_CONTRACT_WBTC_PRICE_FEED as Address,
+  SC_PRICE_FEED: process.env.NEXT_PUBLIC_CONTRACT_SC_PRICE_FEED as Address,
+  STABLE_COIN: process.env.NEXT_PUBLIC_CONTRACT_STABLE_COIN as Address,
+  STABLE_COIN_ENGINE: process.env.NEXT_PUBLIC_CONTRACT_STABLE_COIN_ENGINE as Address,
 } as const;
 
 // Default Anvil accounts
 export const ANVIL_ACCOUNTS = {
-  deployer: (process.env.NEXT_PUBLIC_DEPLOYER_ADDRESS ?? '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266') as Address,
-  user1: '0x70997970C51812dc3A010C7d01b50e0d17dc79C8' as Address,
-  user2: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC' as Address,
+  deployer: process.env.NEXT_PUBLIC_DEPLOYER_ADDRESS as Address,
 } as const;
 
 // Token info
